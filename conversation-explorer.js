@@ -497,7 +497,7 @@ function updateDetailPanel(index) {
   const item = currentViewData[index];
   let content = '';
   
-  if (explorer.getLabel().includes('Conversations')) {
+  if (explorer.options.label.includes('Conversations')) {
     // Conversation detail
     const date = moment(item.created_at || Date.now()).format(config.dateFormat);
     const updated = moment(item.updated_at || Date.now()).format(config.dateFormat);
@@ -538,7 +538,7 @@ function updateDetailPanel(index) {
         content += `\n... and ${item.chat_messages.length - 3} more messages`;
       }
     }
-  } else if (explorer.getLabel().includes('Messages')) {
+  } else if (explorer.options.label.includes('Messages')) {
     // Message detail
     const date = moment(item.created_at || Date.now()).format(config.dateFormat);
     const updated = moment(item.updated_at || Date.now()).format(config.dateFormat);
@@ -619,7 +619,7 @@ function handleCommand(cmd) {
         config.filterEndDate = moment(dateStr).add(1, 'day');
         setStatus(`Date filter set: ${dateStr}`);
       }
-      updateView(explorer.getLabel().includes('Conversations') ? 'conversations' : 'messagesOnly');
+      updateView(explorer.options.label.includes('Conversations') ? 'conversations' : 'messagesOnly');
     } catch (err) {
       setStatus(`Invalid date format: ${err.message}`);
     }
@@ -627,13 +627,13 @@ function handleCommand(cmd) {
     const searchTerm = cmd.substring(7);
     config.searchTerm = searchTerm;
     setStatus(`Search for: "${searchTerm}"`);
-    updateView(explorer.getLabel().includes('Conversations') ? 'conversations' : 'messagesOnly');
+    updateView(explorer.options.label.includes('Conversations') ? 'conversations' : 'messagesOnly');
   } else if (cmd === 'clear') {
     config.searchTerm = '';
     config.filterStartDate = null;
     config.filterEndDate = null;
     setStatus('All filters cleared');
-    updateView(explorer.getLabel().includes('Conversations') ? 'conversations' : 'messagesOnly');
+    updateView(explorer.options.label.includes('Conversations') ? 'conversations' : 'messagesOnly');
   } else {
     setStatus(`Unknown command: ${cmd}`);
   }
@@ -809,8 +809,8 @@ screen.key('s', function() {
   }
   setStatus(`Sorting by ${config.sortBy}`);
   
-  const currentView = explorer.getLabel().includes('Messages') ? 'conversationDetail' :
-                      explorer.getLabel().includes('Conversations with') ? 'messagesOnly' : 'conversations';
+  const currentView = explorer.options.label.includes('Messages') ? 'conversationDetail' :
+                      explorer.options.label.includes('Conversations with') ? 'messagesOnly' : 'conversations';
   updateView(currentView);
 });
 
@@ -818,8 +818,8 @@ screen.key('r', function() {
   config.sortDirection = config.sortDirection === 'asc' ? 'desc' : 'asc';
   setStatus(`Sort direction: ${config.sortDirection}ending`);
   
-  const currentView = explorer.getLabel().includes('Messages') ? 'conversationDetail' :
-                      explorer.getLabel().includes('Conversations with') ? 'messagesOnly' : 'conversations';
+  const currentView = explorer.options.label.includes('Messages') ? 'conversationDetail' :
+                      explorer.options.label.includes('Conversations with') ? 'messagesOnly' : 'conversations';
   updateView(currentView);
 });
 
@@ -845,9 +845,9 @@ screen.key('backspace', function() {
 explorer.on('select', function() {
   updateDetailPanel(explorer.selected);
   
-  // If in conversation list and enter is pressed, show messages
-  if ((explorer.getLabel().includes('Conversations') || explorer.getLabel().includes('Conversation')) && 
-      !explorer.getLabel().includes('Messages')) {
+  // Replace getLabel() with options.label
+  if ((explorer.options.label.includes('Conversations') || explorer.options.label.includes('Conversation')) && 
+      !explorer.options.label.includes('Messages')) {
     config.currentPath = [explorer.selected];
     updateView('conversationDetail');
   }
@@ -939,7 +939,7 @@ function exportMessages(conversation, outputPath) {
 // Add export command handler
 screen.key('e', function() {
   // Only allow export from conversation view
-  if (config.currentPath.length === 1 && explorer.getLabel().includes('Messages')) {
+  if (config.currentPath.length === 1 && explorer.options.label.includes('Messages')) {
     const conversationIndex = config.currentPath[0];
     const conversation = conversationData[conversationIndex] || null;
     
