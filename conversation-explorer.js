@@ -1,22 +1,14 @@
 #!/usr/bin/env node
 
 /**
- * Conversation JSON Explorer - An NCurses-style interface for exploring JSON conversation data
+ * Enhanced Single Conversation Viewer
  * 
- * This tool provides an interface similar to ncdu, but specifically designed for
- * conversation data with the structure:
- * {
- *   "uuid": "...",
- *   "name": "...",
- *   "created_at": "...",
- *   "updated_at": "...",
- *   "account": { "uuid": "..." },
- *   "chat_messages": [...]
- * }
+ * A focused terminal UI for viewing a single conversation with efficient
+ * screen usage, improved readability, and additional filtering options.
+ * Includes ability to hide empty conversations.
  */
 
 const fs = require('fs');
-const path = require('path');
 const blessed = require('blessed');
 const contrib = require('blessed-contrib');
 const moment = require('moment');
@@ -25,952 +17,1268 @@ const chalk = require('chalk');
 // Create a screen object
 const screen = blessed.screen({
   smartCSR: true,
-  title: 'Conversation JSON Explorer'
+  title: 'Enhanced Conversation Viewer'
 });
 
 // Configuration
-let config = {
-  dateFormat: 'YYYY-MM-DD HH:mm:ss',
-  conversationPath: '',
-  tweetsPath: '',
-  currentPath: [],
-  filterStartDate: null,
-  filterEndDate: null,
+const config = {
+  theme: {
+    assistantColor: 'green',
+    userColor: 'blue',
+    systemColor: 'yellow',
+    highlightBg: 'blue',
+    highlightFg: 'white',
+    borderColor: 'white',
+    timestampColor: 'gray'
+  },
+  navigation: {
+    messageListWidth: '20%',  // Can be collapsed to 0%
+    messageListExpanded: true
+  },
+  formatting: {
+    timestampFormat: 'YYYY-MM-DD HH:mm',
+    maxPreviewLength: 30
+  }
+};
+
+// Application state
+const state = {
+  // Current data
+  allConversations: [],      // All loaded conversations
+  filteredConversations: [], // Conversations after filtering
+  currentConversationIndex: 0,
+  conversation: null,
+  messages: [],
+  currentMessageIndex: 0,
+  
+  // UI state
+  isLoading: false,
+  searchMode: false,
   searchTerm: '',
-  sortBy: 'date', // 'date', 'size', 'messages'
-  sortDirection: 'desc'
+  searchResults: [],
+  searchIndex: 0,
+  navCollapsed: false,
+  viewMode: 'normal', // 'normal', 'raw', 'metadata'
+  
+  // Extra modes
+  conversationSwitcherActive: false,
+  
+  // Filters
+  hideEmptyConversations: false
 };
 
-// Data structures
-let conversationData = [];
-let tweetData = [];
-let currentViewData = [];
-let statistics = {
-  totalConversations: 0,
-  totalMessages: 0,
-  messagesByRole: {},
-  byMonth: {},
-  emptyConversations: 0
-};
-
-// Create layout
-const grid = new contrib.grid({rows: 12, cols: 12, screen: screen});
-
-// Chart box for distribution visualization
-const chartBox = blessed.box({
-  parent: screen,
-  width: '90%',
-  height: '80%',
-  top: 'center',
-  left: 'center',
-  tags: true,
-  border: {type: 'line'},
-  style: {border: {fg: 'blue'}},
-  label: ' Message Distribution ',
-  hidden: true
-});
-
-// Message distribution chart
-const distributionChart = contrib.bar({
-  parent: chartBox,
-  label: 'Message Distribution',
-  barWidth: 7,
-  barSpacing: 1,
-  xOffset: 2,
-  maxHeight: 15,
-  height: '90%',
-  width: '90%',
-  top: 2,
-  left: 'center',
-  style: {
-    bar: {
-      bg: 'blue'
-    }
-  }
-});
-
-// Main explorer panel
-const explorer = grid.set(0, 0, 9, 8, blessed.list, {
-  keys: true,
-  vi: true,
-  mouse: true,
-  border: {type: 'line'},
-  style: {
-    selected: {bg: 'blue', fg: 'white', bold: true},
-    item: {fg: 'white'},
-    border: {fg: 'white'}
+// UI Components
+const ui = {
+  // Layout components
+  grid: null,
+  
+  // Header shows conversation title and metadata
+  header: null,
+  
+  // Main message content area
+  messageContent: null,
+  
+  // Navigation sidebar for jumping between messages
+  messageList: null,
+  
+  // Status bar for shortcuts and info
+  statusBar: null,
+  
+  // Command/search input
+  cmdInput: null,
+  
+  // Loading indicator
+  loadingBox: null,
+  
+  // Help modal
+  helpText: null,
+  
+  // Conversation switcher modal
+  conversationSwitcher: null,
+  
+  // Filter settings modal
+  filterSettings: null,
+  
+  // Initialize the UI components with full screen layout
+  init() {
+    // Create the grid layout
+    this.grid = new contrib.grid({rows: 12, cols: 12, screen: screen});
+    
+    // Header area - conversation title and metadata
+    this.header = this.grid.set(0, 0, 1, 12, blessed.box, {
+      content: 'Enhanced Conversation Viewer',
+      tags: true,
+      style: {
+        fg: 'white',
+        bg: 'blue',
+        bold: true
+      }
+    });
+    
+    // Message navigation panel - adjustable width
+    const navWidth = config.navigation.messageListExpanded ? 3 : 0;
+    this.messageList = this.grid.set(1, 0, 10, navWidth, blessed.list, {
+      keys: true,
+      vi: true,
+      mouse: true,
+      border: {type: 'line'},
+      style: {
+        selected: {
+          bg: config.theme.highlightBg,
+          fg: config.theme.highlightFg,
+          bold: true
+        },
+        border: {fg: config.theme.borderColor}
+      },
+      scrollbar: {
+        ch: ' ',
+        style: {bg: 'blue'}
+      },
+      label: ' Messages '
+    });
+    
+    // Message content area - takes most of the screen
+    this.messageContent = this.grid.set(1, navWidth, 10, 12 - navWidth, blessed.box, {
+      label: ' Message Content ',
+      tags: true,
+      content: 'Select a conversation to view',
+      border: {type: 'line'},
+      style: {border: {fg: config.theme.borderColor}},
+      scrollable: true,
+      alwaysScroll: true,
+      keys: true,
+      vi: true,
+      mouse: true,
+      padding: 1
+    });
+    
+    // Add scroll event listeners to message content
+    this.messageContent.key(['pageup'], function() {
+      ui.messageContent.scroll(-ui.messageContent.height || -1);
+      ui.render();
+    });
+    
+    this.messageContent.key(['pagedown'], function() {
+      ui.messageContent.scroll(ui.messageContent.height || 1);
+      ui.render();
+    });
+    
+    // Status bar with shortcut hints
+    this.statusBar = this.grid.set(11, 0, 1, 12, blessed.text, {
+      content: ' {bold}Enhanced Conversation Viewer{/bold} | Press {bold}?{/bold} for help | {bold}q{/bold} to quit',
+      tags: true,
+      style: {
+        fg: 'white',
+        bg: 'blue'
+      }
+    });
+    
+    // Command/search input
+    this.cmdInput = blessed.textbox({
+      parent: screen,
+      bottom: 0,
+      left: 0,
+      right: 0,
+      height: 1,
+      style: {
+        fg: 'white',
+        bg: 'black',
+        focus: {
+          fg: 'white',
+          bg: 'blue'
+        }
+      },
+      inputOnFocus: true,
+      hidden: true
+    });
+    
+    // Loading box
+    this.loadingBox = blessed.loading({
+      parent: screen,
+      border: 'line',
+      height: 5,
+      width: 50,
+      top: 'center',
+      left: 'center',
+      label: ' Loading ',
+      tags: true,
+      hidden: true
+    });
+    
+    // Help text box
+    this.helpText = blessed.box({
+      parent: screen,
+      width: '80%',
+      height: '80%',
+      top: 'center',
+      left: 'center',
+      border: {type: 'line'},
+      style: {border: {fg: 'white'}},
+      hidden: true,
+      scrollable: true,
+      alwaysScroll: true,
+      content: this.getHelpContent(),
+      tags: true,
+      label: ' Keyboard Shortcuts '
+    });
+    
+    // Conversation switcher
+    this.conversationSwitcher = blessed.list({
+      parent: screen,
+      width: '70%',
+      height: '70%',
+      top: 'center',
+      left: 'center',
+      keys: true,
+      vi: true,
+      mouse: true,
+      border: {type: 'line'},
+      style: {
+        selected: {
+          bg: config.theme.highlightBg,
+          fg: config.theme.highlightFg,
+          bold: true
+        },
+        border: {fg: config.theme.borderColor}
+      },
+      scrollbar: {
+        ch: ' ',
+        style: {bg: 'blue'}
+      },
+      label: ' Select Conversation ',
+      hidden: true,
+      tags: true
+    });
+    
+    // Filter settings modal
+    this.filterSettings = blessed.form({
+      parent: screen,
+      width: '50%',
+      height: '40%',
+      top: 'center',
+      left: 'center',
+      keys: true,
+      vi: true,
+      border: {type: 'line'},
+      style: {border: {fg: 'white'}},
+      label: ' Filter Settings ',
+      hidden: true
+    });
+    
+    // Add checkbox for hiding empty conversations
+    this.hideEmptyCheckbox = blessed.checkbox({
+      parent: this.filterSettings,
+      top: 2,
+      left: 2,
+      height: 1,
+      width: '100%-4',
+      text: 'Hide Empty Conversations',
+      checked: state.hideEmptyConversations,
+      style: {
+        fg: 'white',
+        focus: {
+          fg: 'blue'
+        }
+      }
+    });
+    
+    // Add filter apply button
+    this.applyFilterButton = blessed.button({
+      parent: this.filterSettings,
+      top: 5,
+      left: 2,
+      height: 1,
+      width: 10,
+      content: 'Apply',
+      style: {
+        fg: 'white',
+        bg: 'green',
+        focus: {
+          bg: 'blue'
+        }
+      }
+    });
+    
+    // Add filter cancel button
+    this.cancelFilterButton = blessed.button({
+      parent: this.filterSettings,
+      top: 5,
+      left: 15,
+      height: 1,
+      width: 10,
+      content: 'Cancel',
+      style: {
+        fg: 'white',
+        bg: 'red',
+        focus: {
+          bg: 'blue'
+        }
+      }
+    });
+    
+    // Handle apply button
+    this.applyFilterButton.on('press', () => {
+      state.hideEmptyConversations = this.hideEmptyCheckbox.checked;
+      this.filterSettings.hide();
+      applyFilters();
+      this.render();
+    });
+    
+    // Handle cancel button
+    this.cancelFilterButton.on('press', () => {
+      this.hideEmptyCheckbox.checked = state.hideEmptyConversations; // Reset to current state
+      this.filterSettings.hide();
+      this.render();
+    });
   },
-  scrollbar: {
-    ch: ' ',
-    style: {bg: 'blue'}
+  
+  // Get help text content
+  getHelpContent() {
+    return `
+{bold}Enhanced Conversation Viewer Keyboard Commands{/bold}
+
+{bold}Navigation{/bold}
+↑/↓/j/k       Navigate between messages
+n/p           Next/Previous message
+Home/End/g/G  Jump to first/last message
+Page Up/Down  Scroll content up/down
+
+{bold}Display{/bold}
+t             Toggle message list panel
+m             Cycle view modes (normal, raw, metadata)
++/-           Increase/decrease font size
+
+{bold}Conversation Switching{/bold}
+c             Open conversation switcher
+[/] or ←/→    Previous/Next conversation
+ESC           Close conversation switcher
+
+{bold}Search{/bold}
+/             Search (text search in conversation)
+n             Next search result
+N             Previous search result
+ESC           Clear search results
+
+{bold}Filters{/bold}
+f             Open filter settings
+h             Toggle hide empty conversations
+
+{bold}Commands{/bold}
+:             Command mode
+  :load path/to/file.json   Load conversation file
+  :export output.md         Export conversation
+  :theme light/dark         Change theme
+  :filter empty=true/false  Set empty conversation filter
+
+{bold}Other Commands{/bold}
+?             Show/hide this help
+q             Quit application
+
+Press any key to close help
+`;
   },
-  label: ' Conversations '
-});
-
-// Detail panel
-const detailPanel = grid.set(0, 8, 9, 4, blessed.box, {
-  label: ' Details ',
-  content: 'Select an item to view details',
-  border: {type: 'line'},
-  style: {border: {fg: 'white'}},
-  scrollable: true,
-  alwaysScroll: true,
-  keys: true,
-  vi: true,
-  mouse: true
-});
-
-// Status bar
-const statusBar = grid.set(9, 0, 1, 12, blessed.text, {
-  content: ' {bold}Conversation Explorer{/bold} | Press {bold}?{/bold} for help | {bold}q{/bold} to quit',
-  tags: true,
-  style: {
-    fg: 'white',
-    bg: 'blue'
-  }
-});
-
-// Command input
-const cmdInput = grid.set(10, 0, 1, 12, blessed.textbox, {
-  border: {type: 'line'},
-  style: {
-    border: {fg: 'white'},
-    focus: {
-      fg: 'white',
-      bg: 'blue'
-    }
+  
+  // Show loading indicator
+  showLoading(message = 'Loading...') {
+    this.loadingBox.load(message);
+    this.loadingBox.show();
   },
-  inputOnFocus: true,
-  label: ' Command '
-});
-
-// Help text 
-const helpText = blessed.box({
-  parent: screen,
-  width: '80%',
-  height: '80%',
-  top: 'center',
-  left: 'center',
-  border: {type: 'line'},
-  style: {border: {fg: 'white'}},
-  hidden: true,
-  scrollable: true,
-  alwaysScroll: true,
-  content: `
-  {bold}Conversation Explorer Keyboard Commands{/bold}
-
-  {bold}Navigation{/bold}
-  ↑/↓/j/k       Navigate up/down
-  Enter         Open selected conversation / view message details
-  Backspace     Go back to parent
-  Home/End/g/G  Jump to top/bottom
-
-  {bold}Filtering and Sorting{/bold}
-  /             Search (regex supported)
-  t             Filter by date range
-  s             Change sort method (date, size, messages)
-  r             Reverse sort order
-
-  {bold}Views{/bold}
-  1             Show all conversations
-  2             Show conversations with messages
-  3             Show statistics
-
-  {bold}Actions{/bold}
-  e             Export current conversation to Markdown
-  d             Show message distribution chart
-  f             Focus on empty text (for deletion/cleanup)
-
-  {bold}Other Commands{/bold}
-  ?             Show/hide this help
-  :             Command mode (:load, :filter, :search, :export)
-  q             Quit application
-
-  {bold}Command Examples{/bold}
-  :load data.json              Load conversation data
-  :filter 2024-05-01 to 2024-06-01  Filter by date range
-  :search error                Search for text
-  :export conversation.md      Export current conversation
-
-  Press any key to close help
-  `,
-  tags: true
-});
-
-// Function to load data
-function loadData(conversationPath) {
-  try {
-    if (conversationPath && fs.existsSync(conversationPath)) {
-      conversationData = JSON.parse(fs.readFileSync(conversationPath, 'utf8'));
-      config.conversationPath = conversationPath;
-      statistics.totalConversations = conversationData.length;
+  
+  // Hide loading indicator
+  hideLoading() {
+    this.loadingBox.stop();
+    this.loadingBox.hide();
+  },
+  
+  // Update the header with conversation info
+  updateHeader(conversation) {
+    if (!conversation) {
+      this.header.setContent(' {bold}Enhanced Conversation Viewer{/bold} - No conversation loaded');
+      return;
     }
     
-    generateStatistics();
-    updateView('conversations');
+    const title = conversation.name || `Conversation ${conversation.uuid.substring(0, 8)}`;
+    const date = formatDate(conversation.created_at);
+    const msgCount = state.messages.length;
+    
+    let filterInfo = '';
+    if (state.hideEmptyConversations) {
+      filterInfo = ' {bold}[Filtered]{/bold}';
+    }
+    
+    const convInfo = state.filteredConversations.length > 1 ? 
+      `Conv: ${state.currentConversationIndex + 1}/${state.filteredConversations.length}${filterInfo} | ` : '';
+    
+    this.header.setContent(
+      ` {bold}${title}{/bold} | ${convInfo}Created: ${date} | Messages: ${msgCount} | ${state.currentMessageIndex + 1}/${msgCount}`
+    );
+  },
+  
+  // Update the status bar
+  updateStatus(message) {
+    const filterStatus = state.hideEmptyConversations ? 
+      ' | Empty convs hidden' : '';
+    
+    this.statusBar.setContent(
+      ` ${message}${filterStatus} | Press {bold}?{/bold} for help | {bold}q{/bold} to quit | {bold}f{/bold} filters`
+    );
+  },
+  
+  // Toggle navigation panel visibility
+  toggleNavPanel() {
+    state.navCollapsed = !state.navCollapsed;
+    
+    // Destroy and recreate the content panel to avoid size issues
+    this.messageContent.destroy();
+    
+    // Recreate layout with new proportions
+    const navWidth = state.navCollapsed ? 0 : 3;
+    
+    // Hide or show the message list
+    this.messageList.hidden = state.navCollapsed;
+    
+    // Recreate message content with correct dimensions
+    this.messageContent = this.grid.set(1, navWidth, 10, 12 - navWidth, blessed.box, {
+      label: ' Message Content ',
+      tags: true,
+      content: state.messages.length > 0 ? 
+        formatMessage(state.messages[state.currentMessageIndex], state.viewMode) : 
+        'Select a conversation to view',
+      border: {type: 'line'},
+      style: {border: {fg: config.theme.borderColor}},
+      scrollable: true,
+      alwaysScroll: true,
+      keys: true,
+      vi: true,
+      mouse: true,
+      padding: 1
+    });
+    
+    // Reattach content panel event listeners
+    this.messageContent.key(['pageup'], function() {
+      ui.messageContent.scroll(-ui.messageContent.height || -1);
+      ui.render();
+    });
+    
+    this.messageContent.key(['pagedown'], function() {
+      ui.messageContent.scroll(ui.messageContent.height || 1);
+      ui.render();
+    });
+    
+    // Force a full redraw
+    screen.realloc();
+    screen.clearRegion(0, 0, screen.width, screen.height);
+    screen.render();
+  },
+  
+  // Show filter settings
+  showFilterSettings() {
+    this.hideEmptyCheckbox.checked = state.hideEmptyConversations;
+    this.filterSettings.show();
+    this.hideEmptyCheckbox.focus();
+    screen.render();
+  },
+  
+  // Render the screen
+  render() {
+    screen.render();
+  }
+};
+
+// Helper functions
+function formatDate(dateStr, format = config.formatting.timestampFormat) {
+  if (!dateStr) return 'N/A';
+  try {
+    return moment(dateStr).format(format);
+  } catch (e) {
+    return 'Invalid date';
+  }
+}
+
+// Check if a conversation has any non-empty messages
+function hasNonEmptyMessages(conversation) {
+  if (!conversation || !Array.isArray(conversation.chat_messages)) {
+    return false;
+  }
+  
+  // Check each message for content
+  return conversation.chat_messages.some(msg => {
+    const text = getMessageText(msg);
+    return text && text.trim().length > 0;
+  });
+}
+
+// Get message text content from various formats
+function getMessageText(message) {
+  if (!message) return '';
+  
+  // Direct text field
+  if (message.text && typeof message.text === 'string') {
+    return message.text;
+  }
+  
+  // Content array with text fields
+  if (Array.isArray(message.content)) {
+    return message.content
+      .filter(item => item && item.text)
+      .map(item => item.text)
+      .join('\n\n');
+  }
+  
+  return '';
+}
+
+// Format message with sender and timestamp
+function formatMessage(message, viewMode = 'normal') {
+  if (!message) return 'No message selected';
+  
+  const sender = message.sender || 'unknown';
+  const timestamp = formatDate(message.created_at);
+  const text = getMessageText(message);
+  
+  // Different view modes
+  if (viewMode === 'raw') {
+    // Raw JSON view
+    return JSON.stringify(message, null, 2);
+  } else if (viewMode === 'metadata') {
+    // Metadata focused view
+    let output = `{bold}Message ${state.currentMessageIndex + 1}{/bold}\n\n`;
+    output += `UUID: ${message.uuid}\n`;
+    output += `Sender: ${sender}\n`;
+    output += `Created: ${timestamp}\n`;
+    output += `Updated: ${formatDate(message.updated_at)}\n\n`;
+    
+    // Show attachments
+    if (Array.isArray(message.attachments) && message.attachments.length > 0) {
+      output += `{bold}Attachments (${message.attachments.length}):{/bold}\n`;
+      message.attachments.forEach((a, i) => {
+        output += `${i+1}. ${a.file_name || 'Unnamed'} (${a.file_type || 'unknown'})\n`;
+      });
+      output += '\n';
+    }
+    
+    // Show content structure
+    if (Array.isArray(message.content) && message.content.length > 0) {
+      output += `{bold}Content Structure (${message.content.length} parts):{/bold}\n`;
+      message.content.forEach((part, i) => {
+        output += `Part ${i+1}: ${part.type || 'unknown'} (${part.text ? part.text.length : 0} chars)\n`;
+      });
+    }
+    
+    return output;
+  } else {
+    // Normal readable view
+    let senderColor = config.theme.userColor;
+    if (sender.toLowerCase().includes('assistant')) {
+      senderColor = config.theme.assistantColor;
+    } else if (sender.toLowerCase().includes('system')) {
+      senderColor = config.theme.systemColor;
+    }
+    
+    let output = `{${senderColor}-fg}{bold}${sender}{/bold}{/${senderColor}-fg} `;
+    output += `{${config.theme.timestampColor}-fg}[${timestamp}]{/${config.theme.timestampColor}-fg}\n\n`;
+    
+    // Handle code blocks with syntax highlighting
+    let formattedText = text;
+    
+    // Simple markdown-style code block handling
+    formattedText = formattedText.replace(/```(\w+)?\n([\s\S]*?)\n```/g, (match, lang, code) => {
+      return `\n{white-bg}{black-fg}${lang || 'Code'}:{/black-fg}{/white-bg}\n{black-bg}{green-fg}${code}{/green-fg}{/black-bg}\n`;
+    });
+    
+    output += formattedText;
+    return output;
+  }
+}
+
+// Apply filters to the conversation list
+function applyFilters() {
+  // Force screen reallocation to prevent UI artifacts
+  screen.realloc();
+  
+  // Start with all conversations
+  if (state.hideEmptyConversations) {
+    // Filter to only show conversations with non-empty messages
+    state.filteredConversations = state.allConversations.filter(hasNonEmptyMessages);
+  } else {
+    // Show all conversations
+    state.filteredConversations = [...state.allConversations];
+  }
+  
+  // Update status bar
+  const message = state.hideEmptyConversations 
+    ? `Showing ${state.filteredConversations.length} non-empty conversations (filtered from ${state.allConversations.length})`
+    : `Showing all ${state.allConversations.length} conversations`;
+  
+  ui.updateStatus(message);
+
+  // Reset conversation index or choose best valid one
+  if (state.filteredConversations.length === 0) {
+    // No conversations match the filter
+    state.currentConversationIndex = -1;
+    state.conversation = null;
+    state.messages = [];
+    
+    // Update UI to show no conversations available
+    ui.messageList.clearItems();
+    ui.messageContent.setContent('No conversations match current filters. Press {bold}h{/bold} to show all conversations.');
+    ui.updateHeader(null);
+    
+    // Force a full screen redraw to prevent UI artifacts
+    screen.clearRegion(0, 0, screen.width, screen.height);
     screen.render();
     
-    setStatus(`Loaded ${statistics.totalConversations} conversations with ${statistics.totalMessages} messages`);
-  } catch (err) {
-    setStatus(`Error loading data: ${err.message}`);
-  }
-}
-
-// Generate statistics from loaded data
-function generateStatistics() {
-  statistics.totalMessages = 0;
-  statistics.messagesByRole = {};
-  statistics.byMonth = {};
-  statistics.emptyConversations = 0;
-  statistics.emptyMessages = 0;
-  statistics.messagesByDay = {};
-  statistics.messageLengths = {
-    empty: 0,
-    short: 0,  // 1-50 chars
-    medium: 0, // 51-500 chars
-    long: 0    // 500+ chars
-  };
-  
-  // Process conversation data
-  conversationData.forEach(conv => {
-    if (!conv.chat_messages || conv.chat_messages.length === 0) {
-      statistics.emptyConversations++;
-      return;
-    }
+    return false;
+  } else if (state.currentConversationIndex >= state.filteredConversations.length) {
+    // Current index is now out of bounds, reset to the last valid one
+    state.currentConversationIndex = state.filteredConversations.length - 1;
+    loadConversation(state.currentConversationIndex);
+  } else if (state.currentConversationIndex < 0 && state.filteredConversations.length > 0) {
+    // No current conversation but we have valid ones, load the first
+    state.currentConversationIndex = 0;
+    loadConversation(0);
+  } else if (state.conversation) {
+    // Check if current conversation is still in filtered list
+    const currentUuid = state.conversation.uuid;
+    const stillExists = state.filteredConversations.some(c => c.uuid === currentUuid);
     
-    statistics.totalMessages += conv.chat_messages.length;
-    
-    // Process by month
-    const date = moment(conv.created_at || Date.now());
-    const month = date.format('YYYY-MM');
-    const day = date.format('YYYY-MM-DD');
-    
-    if (!statistics.byMonth[month]) {
-      statistics.byMonth[month] = {
-        conversations: 0,
-        messages: 0
-      };
-    }
-    
-    if (!statistics.messagesByDay[day]) {
-      statistics.messagesByDay[day] = 0;
-    }
-    
-    statistics.byMonth[month].conversations++;
-    statistics.byMonth[month].messages += conv.chat_messages.length;
-    statistics.messagesByDay[day] += conv.chat_messages.length;
-    
-    // Count messages by role and analyze content
-    conv.chat_messages.forEach(msg => {
-      const role = msg.sender || "unknown";
-      statistics.messagesByRole[role] = (statistics.messagesByRole[role] || 0) + 1;
-      
-      // Check for empty messages
-      let messageText = '';
-      if (msg.text && msg.text.length > 0) {
-        messageText = msg.text;
-      } else if (msg.content && msg.content.length > 0) {
-        messageText = msg.content.map(part => part.text || '').join(' ');
-      }
-      
-      // Categorize by length
-      const length = messageText.trim().length;
-      if (length === 0) {
-        statistics.emptyMessages++;
-        statistics.messageLengths.empty++;
-      } else if (length <= 50) {
-        statistics.messageLengths.short++;
-      } else if (length <= 500) {
-        statistics.messageLengths.medium++;
-      } else {
-        statistics.messageLengths.long++;
-      }
-    });
-  });
-}
-
-// Update the view based on the current mode
-function updateView(mode = 'conversations') {
-  explorer.setLabel(` ${mode.charAt(0).toUpperCase() + mode.slice(1)} `);
-  explorer.clearItems();
-  
-  if (mode === 'conversations') {
-    showConversations();
-  } else if (mode === 'messagesOnly') {
-    showConversationsWithMessages();
-  } else if (mode === 'statistics') {
-    showStatistics();
-  } else if (mode === 'conversationDetail') {
-    showConversationDetail();
-  }
-  
-  screen.render();
-}
-
-// Show all conversations in the explorer
-function showConversations() {
-  // Apply filters
-  currentViewData = conversationData.filter(item => {
-    // Date filter
-    if (config.filterStartDate || config.filterEndDate) {
-      const date = moment(item.created_at || Date.now());
-      if (config.filterStartDate && date.isBefore(config.filterStartDate)) return false;
-      if (config.filterEndDate && date.isAfter(config.filterEndDate)) return false;
-    }
-    
-    // Search filter
-    if (config.searchTerm) {
-      const searchIn = JSON.stringify(item).toLowerCase();
-      if (!searchIn.includes(config.searchTerm.toLowerCase())) return false;
-    }
-    
-    return true;
-  });
-  
-  // Sort items
-  currentViewData.sort((a, b) => {
-    let aVal, bVal;
-    
-    if (config.sortBy === 'date') {
-      aVal = moment(a.created_at || 0).valueOf();
-      bVal = moment(b.created_at || 0).valueOf();
-    } else if (config.sortBy === 'size') {
-      aVal = JSON.stringify(a).length;
-      bVal = JSON.stringify(b).length;
-    } else if (config.sortBy === 'messages') {
-      aVal = (a.chat_messages || []).length;
-      bVal = (b.chat_messages || []).length;
-    }
-    
-    return config.sortDirection === 'asc' ? aVal - bVal : bVal - aVal;
-  });
-  
-  // Display items
-  currentViewData.forEach(item => {
-    const date = moment(item.created_at || Date.now()).format(config.dateFormat);
-    const messageCount = (item.chat_messages || []).length;
-    const title = item.name || `Conversation ${item.uuid.substring(0, 8)}`;
-    const size = (JSON.stringify(item).length / 1024).toFixed(1) + 'KB';
-    
-    explorer.addItem(`${date} │ ${messageCount} msgs │ ${size} │ ${title.substring(0, 40)}`);
-  });
-  
-  setStatus(`Showing ${currentViewData.length} of ${statistics.totalConversations} conversations`);
-}
-
-// Show only conversations with messages
-function showConversationsWithMessages() {
-  // Apply filters with additional message filter
-  currentViewData = conversationData.filter(item => {
-    // Must have messages
-    if (!item.chat_messages || item.chat_messages.length === 0) return false;
-    
-    // Date filter
-    if (config.filterStartDate || config.filterEndDate) {
-      const date = moment(item.created_at || Date.now());
-      if (config.filterStartDate && date.isBefore(config.filterStartDate)) return false;
-      if (config.filterEndDate && date.isAfter(config.filterEndDate)) return false;
-    }
-    
-    // Search filter
-    if (config.searchTerm) {
-      const searchIn = JSON.stringify(item).toLowerCase();
-      if (!searchIn.includes(config.searchTerm.toLowerCase())) return false;
-    }
-    
-    return true;
-  });
-  
-  // Sort items
-  currentViewData.sort((a, b) => {
-    let aVal, bVal;
-    
-    if (config.sortBy === 'date') {
-      aVal = moment(a.created_at || 0).valueOf();
-      bVal = moment(b.created_at || 0).valueOf();
-    } else if (config.sortBy === 'size') {
-      aVal = JSON.stringify(a).length;
-      bVal = JSON.stringify(b).length;
-    } else if (config.sortBy === 'messages') {
-      aVal = (a.chat_messages || []).length;
-      bVal = (b.chat_messages || []).length;
-    }
-    
-    return config.sortDirection === 'asc' ? aVal - bVal : bVal - aVal;
-  });
-  
-  // Display items
-  currentViewData.forEach(item => {
-    const date = moment(item.created_at || Date.now()).format(config.dateFormat);
-    const messageCount = (item.chat_messages || []).length;
-    const title = item.name || `Conversation ${item.uuid.substring(0, 8)}`;
-    const size = (JSON.stringify(item).length / 1024).toFixed(1) + 'KB';
-    
-    explorer.addItem(`${date} │ ${messageCount} msgs │ ${size} │ ${title.substring(0, 40)}`);
-  });
-  
-  setStatus(`Showing ${currentViewData.length} conversations with messages (of ${statistics.totalConversations} total)`);
-}
-
-// Show conversation detail (messages)
-function showConversationDetail() {
-  if (config.currentPath.length !== 1) {
-    updateView('conversations');
-    return;
-  }
-  
-  const conversationIndex = config.currentPath[0];
-  const conversation = currentViewData[conversationIndex];
-  
-  if (!conversation || !conversation.chat_messages) {
-    updateView('conversations');
-    return;
-  }
-  
-  // Set the conversation as the current view data
-  currentViewData = conversation.chat_messages;
-  
-  // Display messages
-  currentViewData.forEach((msg, index) => {
-    const date = moment(msg.created_at || Date.now()).format(config.dateFormat);
-    const role = msg.sender || 'unknown';
-    
-    // Get a short preview of the message text
-    let preview = '';
-    if (msg.text && msg.text.length > 0) {
-      preview = msg.text.substring(0, 40).replace(/\n/g, ' ');
-    } else if (msg.content && msg.content.length > 0 && msg.content[0].text) {
-      preview = msg.content[0].text.substring(0, 40).replace(/\n/g, ' ');
-    }
-    
-    if (preview.length > 0) {
-      preview = `│ ${preview}${preview.length >= 40 ? '...' : ''}`;
-    }
-    
-    explorer.addItem(`${index + 1}. ${date} │ ${role} ${preview}`);
-  });
-  
-  // Update title and status
-  const title = conversation.name || `Conversation ${conversation.uuid.substring(0, 8)}`;
-  explorer.setLabel(` Messages: ${title} `);
-  setStatus(`Showing ${currentViewData.length} messages from conversation ${conversation.uuid.substring(0, 8)}`);
-}
-
-// Show statistics in the explorer
-function showStatistics() {
-  explorer.addItem('Monthly Activity');
-  explorer.addItem('───────────────────────');
-  
-  const months = Object.keys(statistics.byMonth).sort();
-  months.forEach(month => {
-    const stats = statistics.byMonth[month];
-    explorer.addItem(`${month} │ ${stats.conversations} convs │ ${stats.messages} msgs`);
-  });
-  
-  explorer.addItem('');
-  explorer.addItem('Message Count by Role');
-  explorer.addItem('───────────────────────');
-  
-  Object.entries(statistics.messagesByRole).forEach(([role, count]) => {
-    explorer.addItem(`${role} │ ${count} messages`);
-  });
-  
-  explorer.addItem('');
-  explorer.addItem('General Statistics');
-  explorer.addItem('───────────────────────');
-  explorer.addItem(`Total conversations: ${statistics.totalConversations}`);
-  explorer.addItem(`Conversations with messages: ${statistics.totalConversations - statistics.emptyConversations}`);
-  explorer.addItem(`Empty conversations: ${statistics.emptyConversations}`);
-  explorer.addItem(`Total messages: ${statistics.totalMessages}`);
-  explorer.addItem(`Average messages per conversation: ${(statistics.totalMessages / (statistics.totalConversations - statistics.emptyConversations)).toFixed(2)}`);
-  
-  setStatus('Showing conversation statistics');
-}
-
-// Update detail panel with selected item's data
-function updateDetailPanel(index) {
-  if (index < 0 || index >= currentViewData.length) {
-    detailPanel.setContent('No item selected');
-    return;
-  }
-  
-  const item = currentViewData[index];
-  let content = '';
-  
-  if (explorer.options.label.includes('Conversations')) {
-    // Conversation detail
-    const date = moment(item.created_at || Date.now()).format(config.dateFormat);
-    const updated = moment(item.updated_at || Date.now()).format(config.dateFormat);
-    const title = item.name || `Conversation ${item.uuid.substring(0, 8)}`;
-    
-    content = `{bold}${title}{/bold}\n\n`;
-    content += `UUID: ${item.uuid}\n`;
-    content += `Created: ${date}\n`;
-    content += `Updated: ${updated}\n`;
-    content += `Messages: ${(item.chat_messages || []).length}\n`;
-    
-    if (item.account && item.account.uuid) {
-      content += `Account: ${item.account.uuid}\n`;
-    }
-    
-    if (item.chat_messages && item.chat_messages.length > 0) {
-      content += `\n{bold}Message Preview:{/bold}\n`;
-      
-      item.chat_messages.slice(0, 3).forEach((msg, i) => {
-        const role = msg.sender || 'unknown';
-        
-        // Get message text
-        let text = '';
-        if (msg.text && msg.text.length > 0) {
-          text = msg.text.substring(0, 100);
-        } else if (msg.content && msg.content.length > 0 && msg.content[0].text) {
-          text = msg.content[0].text.substring(0, 100);
-        }
-        
-        if (text.length > 0) {
-          content += `\n${i+1}. ${role}: ${text}${text.length >= 100 ? '...' : ''}\n`;
-        } else {
-          content += `\n${i+1}. ${role}: (empty message)\n`;
-        }
-      });
-      
-      if (item.chat_messages.length > 3) {
-        content += `\n... and ${item.chat_messages.length - 3} more messages`;
-      }
-    }
-  } else if (explorer.options.label.includes('Messages')) {
-    // Message detail
-    const date = moment(item.created_at || Date.now()).format(config.dateFormat);
-    const updated = moment(item.updated_at || Date.now()).format(config.dateFormat);
-    const role = item.sender || 'unknown';
-    
-    content = `{bold}Message from ${role}{/bold}\n\n`;
-    content += `UUID: ${item.uuid}\n`;
-    content += `Created: ${date}\n`;
-    content += `Updated: ${updated}\n`;
-    
-    // Get message text
-    if (item.text && item.text.length > 0) {
-      content += `\n{bold}Text:{/bold}\n${item.text}\n`;
-    }
-    
-    // Handle content array
-    if (item.content && item.content.length > 0) {
-      content += `\n{bold}Content (${item.content.length} parts):{/bold}\n`;
-      
-      item.content.forEach((part, i) => {
-        content += `\nPart ${i+1} (${part.type || 'unknown'}):\n`;
-        
-        if (part.text && part.text.length > 0) {
-          content += `${part.text}\n`;
-        } else {
-          content += `(empty text)\n`;
-        }
-        
-        if (part.citations && part.citations.length > 0) {
-          content += `Citations: ${part.citations.length}\n`;
-        }
-      });
-    }
-    
-    // Show attachments if any
-    if (item.attachments && item.attachments.length > 0) {
-      content += `\n{bold}Attachments:{/bold} ${item.attachments.length}\n`;
-    }
-    
-    // Show files if any
-    if (item.files && item.files.length > 0) {
-      content += `\n{bold}Files:{/bold} ${item.files.length}\n`;
-    }
-  }
-  
-  detailPanel.setContent(content);
-  detailPanel.scrollTo(0);
-  screen.render();
-}
-
-// Set status message
-function setStatus(message) {
-  statusBar.setContent(` {bold}Conversation Explorer{/bold} | ${message} | Press {bold}?{/bold} for help | {bold}q{/bold} to quit`);
-  screen.render();
-}
-
-// Command handler
-function handleCommand(cmd) {
-  cmd = cmd.trim();
-  
-  if (cmd.startsWith('load ')) {
-    const path = cmd.substring(5).trim();
-    loadData(path);
-  } else if (cmd.startsWith('filter ')) {
-    const dateStr = cmd.substring(7);
-    try {
-      if (dateStr === 'clear') {
-        config.filterStartDate = null;
-        config.filterEndDate = null;
-        setStatus('Date filter cleared');
-      } else if (dateStr.includes(' to ')) {
-        const [start, end] = dateStr.split(' to ');
-        config.filterStartDate = moment(start);
-        config.filterEndDate = moment(end);
-        setStatus(`Date filter set: ${start} to ${end}`);
-      } else {
-        config.filterStartDate = moment(dateStr);
-        config.filterEndDate = moment(dateStr).add(1, 'day');
-        setStatus(`Date filter set: ${dateStr}`);
-      }
-      updateView(explorer.options.label.includes('Conversations') ? 'conversations' : 'messagesOnly');
-    } catch (err) {
-      setStatus(`Invalid date format: ${err.message}`);
-    }
-  } else if (cmd.startsWith('search ')) {
-    const searchTerm = cmd.substring(7);
-    config.searchTerm = searchTerm;
-    setStatus(`Search for: "${searchTerm}"`);
-    updateView(explorer.options.label.includes('Conversations') ? 'conversations' : 'messagesOnly');
-  } else if (cmd === 'clear') {
-    config.searchTerm = '';
-    config.filterStartDate = null;
-    config.filterEndDate = null;
-    setStatus('All filters cleared');
-    updateView(explorer.options.label.includes('Conversations') ? 'conversations' : 'messagesOnly');
-  } else {
-    setStatus(`Unknown command: ${cmd}`);
-  }
-}
-
-// Show message distribution chart
-function showDistributionChart() {
-  // Prepare data for bar chart
-  const data = {
-    titles: [],
-    data: []
-  };
-
-  // Add message distribution by role
-  const roleData = Object.entries(statistics.messagesByRole)
-    .map(([role, count]) => ({
-      title: role,
-      count
-    }))
-    .sort((a, b) => b.count - a.count);
-
-  roleData.forEach(item => {
-    data.titles.push(item.title);
-    data.data.push(item.count);
-  });
-
-  // Add message distribution by length
-  const lengthLabels = {
-    empty: 'Empty',
-    short: '1-50 chars',
-    medium: '51-500 chars',
-    long: '500+ chars'
-  };
-
-  Object.entries(statistics.messageLengths).forEach(([key, count]) => {
-    data.titles.push(lengthLabels[key]);
-    data.data.push(count);
-  });
-
-  // Add some time-based statistics
-  const months = Object.keys(statistics.byMonth).sort().slice(-5); // Last 5 months
-  months.forEach(month => {
-    data.titles.push(month);
-    data.data.push(statistics.byMonth[month].messages);
-  });
-
-  // Update chart
-  distributionChart.setData({
-    titles: data.titles,
-    data: data.data
-  });
-
-  chartBox.show();
-  screen.render();
-}
-
-// Show conversations with empty messages
-function showEmptyMessages() {
-  // Filter for conversations containing empty messages
-  currentViewData = conversationData.filter(conv => {
-    if (!conv.chat_messages || conv.chat_messages.length === 0) return false;
-    
-    // Check if any messages are empty
-    return conv.chat_messages.some(msg => {
-      let messageText = '';
-      if (msg.text && msg.text.length > 0) {
-        messageText = msg.text;
-      } else if (msg.content && msg.content.length > 0) {
-        messageText = msg.content.map(part => part.text || '').join(' ');
-      }
-      return messageText.trim().length === 0;
-    });
-  });
-  
-  // Sort items (default to date)
-  currentViewData.sort((a, b) => {
-    const aDate = moment(a.created_at || 0).valueOf();
-    const bDate = moment(b.created_at || 0).valueOf();
-    return config.sortDirection === 'asc' ? aDate - bDate : bDate - aDate;
-  });
-  
-  // Clear the list and update label
-  explorer.clearItems();
-  explorer.setLabel(' Conversations with Empty Messages ');
-  
-  // Display items
-  currentViewData.forEach(item => {
-    const date = moment(item.created_at || Date.now()).format(config.dateFormat);
-    const messageCount = (item.chat_messages || []).length;
-    const title = item.name || `Conversation ${item.uuid.substring(0, 8)}`;
-    
-    // Count empty messages
-    const emptyCount = item.chat_messages.filter(msg => {
-      let messageText = '';
-      if (msg.text && msg.text.length > 0) {
-        messageText = msg.text;
-      } else if (msg.content && msg.content.length > 0) {
-        messageText = msg.content.map(part => part.text || '').join(' ');
-      }
-      return messageText.trim().length === 0;
-    }).length;
-    
-    explorer.addItem(`${date} │ ${emptyCount}/${messageCount} empty │ ${title.substring(0, 40)}`);
-  });
-  
-  setStatus(`Found ${currentViewData.length} conversations with empty messages`);
-  screen.render();
-}
-
-// Key event handlers
-screen.key(['escape', 'q', 'C-c'], function() {
-  return process.exit(0);
-});
-
-screen.key('?', function() {
-  helpText.toggle();
-  screen.render();
-});
-
-// Show distribution chart
-screen.key('d', function() {
-  showDistributionChart();
-});
-
-// Close chart on any key
-chartBox.key(['escape', 'q', 'enter', 'space', 'd'], function() {
-  chartBox.hide();
-  screen.render();
-});
-
-// Filter to show only conversations with empty messages
-screen.key('f', function() {
-  showEmptyMessages();
-});
-
-helpText.key(['escape', 'q', 'enter', 'space'], function() {
-  helpText.hide();
-  screen.render();
-});
-
-screen.key('1', function() {
-  config.currentPath = [];
-  updateView('conversations');
-});
-
-screen.key('2', function() {
-  config.currentPath = [];
-  updateView('messagesOnly');
-});
-
-screen.key('3', function() {
-  config.currentPath = [];
-  updateView('statistics');
-});
-
-screen.key('/', function() {
-  cmdInput.setValue('search ');
-  cmdInput.focus();
-});
-
-screen.key('t', function() {
-  cmdInput.setValue('filter ');
-  cmdInput.focus();
-});
-
-screen.key('s', function() {
-  if (config.sortBy === 'date') {
-    config.sortBy = 'size';
-  } else if (config.sortBy === 'size') {
-    config.sortBy = 'messages';
-  } else {
-    config.sortBy = 'date';
-  }
-  setStatus(`Sorting by ${config.sortBy}`);
-  
-  const currentView = explorer.options.label.includes('Messages') ? 'conversationDetail' :
-                      explorer.options.label.includes('Conversations with') ? 'messagesOnly' : 'conversations';
-  updateView(currentView);
-});
-
-screen.key('r', function() {
-  config.sortDirection = config.sortDirection === 'asc' ? 'desc' : 'asc';
-  setStatus(`Sort direction: ${config.sortDirection}ending`);
-  
-  const currentView = explorer.options.label.includes('Messages') ? 'conversationDetail' :
-                      explorer.options.label.includes('Conversations with') ? 'messagesOnly' : 'conversations';
-  updateView(currentView);
-});
-
-screen.key(':', function() {
-  cmdInput.setValue('');
-  cmdInput.focus();
-});
-
-screen.key('backspace', function() {
-  if (config.currentPath.length > 0) {
-    config.currentPath.pop();
-    
-    if (config.currentPath.length === 0) {
-      // Back to main list
-      updateView('conversations');
+    if (!stillExists) {
+      // Current conversation was filtered out, load first available
+      state.currentConversationIndex = 0;
+      loadConversation(0);
     } else {
-      // Back to previous level (currently not implemented for nested navigation)
-      updateView('conversations');
+      // Current conversation still valid, refresh UI
+      updateConversationSwitcher();
+      ui.updateHeader(state.conversation);
+      
+      // Force a full screen redraw to prevent UI artifacts
+      screen.clearRegion(0, 0, screen.width, screen.height);
+      screen.render();
     }
   }
-});
-
-explorer.on('select', function() {
-  updateDetailPanel(explorer.selected);
   
-  // Replace getLabel() with options.label
-  if ((explorer.options.label.includes('Conversations') || explorer.options.label.includes('Conversation')) && 
-      !explorer.options.label.includes('Messages')) {
-    config.currentPath = [explorer.selected];
-    updateView('conversationDetail');
-  }
-});
-
-cmdInput.key(['escape'], function() {
-  cmdInput.cancel();
-  screen.render();
-});
-
-cmdInput.key(['enter'], function() {
-  const cmd = cmdInput.getValue();
-  cmdInput.clearValue();
-  cmdInput.cancel();
-  handleCommand(cmd);
-});
-
-// Initialize application
-setStatus('Welcome to Conversation Explorer! Load data with the command: load <conversations_path>');
-screen.render();
-explorer.focus();
-
-// If command line arguments are provided, try to load the data automatically
-if (process.argv.length >= 3) {
-  const convPath = process.argv[2];
-  loadData(convPath);
-} else {
-  // Show usage instructions
-  console.log(`
-Conversation JSON Explorer - An NCurses-style interface for exploring JSON conversation data
-
-Usage:
-  node conversation-explorer.js <path_to_json_file>
-
-Example:
-  node conversation-explorer.js conversations.json
-
-If no file is provided, you can load a file using the ':load <path>' command within the application.
-  `);
+  return true;
 }
 
-// Export message contents to a text file
-function exportMessages(conversation, outputPath) {
+// Data loading
+async function loadConversationFile(filePath) {
   try {
-    if (!conversation || !conversation.chat_messages || conversation.chat_messages.length === 0) {
-      setStatus('No messages to export');
-      return;
+    ui.showLoading('Loading conversation file...');
+    
+    // Read and parse the file
+    const rawData = fs.readFileSync(filePath, 'utf8');
+    const data = JSON.parse(rawData);
+    
+    if (Array.isArray(data)) {
+      // Store all conversations
+      state.allConversations = data;
+      
+      // Apply filters - will repopulate filteredConversations
+      const hasValidConversations = applyFilters();
+      
+      ui.updateStatus(`Loaded ${data.length} conversations from ${filePath}`);
+      
+      if (hasValidConversations) {
+        // Load the first conversation if we haven't already in applyFilters
+        if (state.currentConversationIndex < 0 && state.filteredConversations.length > 0) {
+          loadConversation(0);
+        }
+      }
+    } else {
+      // Single conversation object
+      state.allConversations = [data];
+      
+      // Apply filters
+      const hasValidConversations = applyFilters();
+      
+      if (hasValidConversations) {
+        loadConversation(0);
+        ui.updateStatus(`Loaded single conversation`);
+      }
+    }
+    
+    ui.hideLoading();
+    ui.render();
+    
+  } catch (err) {
+    ui.hideLoading();
+    ui.updateStatus(`Error loading conversation: ${err.message}`);
+    console.error('Error loading conversation:', err);
+  }
+}
+
+// Load a specific conversation by index in the filtered list
+function loadConversation(index) {
+  if (index < 0 || index >= state.filteredConversations.length) {
+    ui.updateStatus(`Invalid conversation index: ${index}`);
+    return;
+  }
+  
+  state.currentConversationIndex = index;
+  state.conversation = state.filteredConversations[index];
+  
+  // Extract messages
+  if (state.conversation && Array.isArray(state.conversation.chat_messages)) {
+    state.messages = state.conversation.chat_messages;
+    state.currentMessageIndex = 0;
+  } else {
+    state.messages = [];
+  }
+  
+  // Update UI
+  updateMessageList();
+  ui.updateHeader(state.conversation);
+  
+  if (state.messages.length > 0) {
+    showMessage(state.currentMessageIndex);
+  } else {
+    ui.messageContent.setContent('No messages in this conversation');
+  }
+  
+  const filterIndicator = state.hideEmptyConversations ? 
+    ' (filtered view)' : '';
+  
+  ui.updateStatus(`Loaded conversation ${index + 1} of ${state.filteredConversations.length}${filterIndicator}`);
+  ui.render();
+}
+
+// Update the message list
+function updateMessageList() {
+  ui.messageList.clearItems();
+  
+  state.messages.forEach((msg, idx) => {
+    const sender = msg.sender || 'unknown';
+    const text = getMessageText(msg);
+    let preview = text ? text.replace(/\n/g, ' ').substring(0, config.formatting.maxPreviewLength) : '';
+    
+    if (preview.length >= config.formatting.maxPreviewLength) {
+      preview += '...';
+    }
+    
+    if (preview.length === 0) {
+      preview = '(empty)';
+    }
+    
+    ui.messageList.addItem(`${idx + 1}. ${sender}: ${preview}`);
+  });
+  
+  if (state.currentMessageIndex >= 0 && state.currentMessageIndex < state.messages.length) {
+    ui.messageList.select(state.currentMessageIndex);
+  }
+}
+
+// Show a specific message
+function showMessage(index) {
+  if (index < 0 || index >= state.messages.length) {
+    return;
+  }
+  
+  state.currentMessageIndex = index;
+  const message = state.messages[index];
+  
+  ui.messageContent.setContent(formatMessage(message, state.viewMode));
+  ui.messageContent.scrollTo(0);
+  
+  ui.messageList.select(index);
+  ui.updateHeader(state.conversation);
+  ui.updateStatus(`Message ${index + 1} of ${state.messages.length}`);
+  
+  ui.render();
+}
+
+// Toggle view mode (cycles through normal, raw, metadata)
+function toggleViewMode() {
+  const modes = ['normal', 'raw', 'metadata'];
+  const currentIndex = modes.indexOf(state.viewMode);
+  state.viewMode = modes[(currentIndex + 1) % modes.length];
+  
+  // Refresh current message with new view mode
+  showMessage(state.currentMessageIndex);
+  ui.updateStatus(`View mode: ${state.viewMode}`);
+}
+
+// Export conversation to markdown
+function exportConversation(outputPath) {
+  try {
+    if (!state.conversation || state.messages.length === 0) {
+      ui.updateStatus('No conversation to export');
+      return false;
     }
     
     let output = '';
     
     // Add conversation metadata
-    const title = conversation.name || `Conversation ${conversation.uuid}`;
-    const date = moment(conversation.created_at || Date.now()).format(config.dateFormat);
+    const title = state.conversation.name || `Conversation ${state.conversation.uuid}`;
+    const date = formatDate(state.conversation.created_at);
     
     output += `# ${title}\n`;
     output += `Date: ${date}\n`;
-    output += `UUID: ${conversation.uuid}\n\n`;
+    output += `UUID: ${state.conversation.uuid}\n\n`;
     
     // Add messages
-    conversation.chat_messages.forEach((msg, index) => {
+    state.messages.forEach((msg, index) => {
       const role = msg.sender || 'unknown';
-      const date = moment(msg.created_at || Date.now()).format(config.dateFormat);
+      const date = formatDate(msg.created_at);
       
       output += `## Message ${index + 1} (${role}) - ${date}\n\n`;
       
       // Get message text
-      let text = '';
-      if (msg.text && msg.text.length > 0) {
-        text = msg.text;
-      } else if (msg.content && msg.content.length > 0) {
-        // Combine all content parts
-        text = msg.content.map(part => part.text || '').join('\n\n');
-      }
-      
+      const text = getMessageText(msg);
       output += `${text || '(empty message)'}\n\n`;
+      
+      // Add attachments if any
+      if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+        output += `### Attachments\n`;
+        msg.attachments.forEach((attach, i) => {
+          output += `- ${attach.file_name || 'Unnamed'} (${attach.file_type || 'unknown'})\n`;
+        });
+        output += '\n';
+      }
     });
     
     // Write to file
-    const finalPath = outputPath || `conversation_${conversation.uuid.substring(0, 8)}.md`;
+    const finalPath = outputPath || `conversation_export_${state.conversation.uuid.substring(0, 8)}.md`;
     fs.writeFileSync(finalPath, output);
     
-    setStatus(`Exported ${conversation.chat_messages.length} messages to ${finalPath}`);
+    ui.updateStatus(`Exported ${state.messages.length} messages to ${finalPath}`);
+    return true;
+    
   } catch (err) {
-    setStatus(`Error exporting messages: ${err.message}`);
+    ui.updateStatus(`Error exporting messages: ${err.message}`);
+    console.error('Export error:', err);
+    return false;
   }
 }
 
-// Add export command handler
-screen.key('e', function() {
-  // Only allow export from conversation view
-  if (config.currentPath.length === 1 && explorer.options.label.includes('Messages')) {
-    const conversationIndex = config.currentPath[0];
-    const conversation = conversationData[conversationIndex] || null;
-    
-    if (conversation) {
-      cmdInput.setValue(`export ${conversation.uuid.substring(0, 8)}.md`);
-      cmdInput.focus();
-    }
-  } else {
-    setStatus('Select a conversation first to export its messages');
+// Search in conversation
+function searchInConversation(term) {
+  if (!term || term.length === 0) {
+    state.searchResults = [];
+    state.searchMode = false;
+    ui.updateStatus('Search canceled');
+    return;
   }
-});
+  
+  state.searchTerm = term;
+  state.searchResults = [];
+  state.searchIndex = 0;
+  
+  // Search in all messages
+  state.messages.forEach((msg, idx) => {
+    const text = getMessageText(msg).toLowerCase();
+    if (text.includes(term.toLowerCase())) {
+      state.searchResults.push(idx);
+    }
+  });
+  
+  if (state.searchResults.length > 0) {
+    state.searchMode = true;
+    ui.updateStatus(`Found ${state.searchResults.length} results for "${term}"`);
+    
+    // Jump to first result
+    showMessage(state.searchResults[0]);
+  } else {
+    state.searchMode = false;
+    ui.updateStatus(`No results found for "${term}"`);
+  }
+}
 
-// Extend command handler for export
-const oldHandleCommand = handleCommand;
-handleCommand = function(cmd) {
-  if (cmd.startsWith('export ')) {
-    const outputPath = cmd.substring(7).trim();
-    
-    if (config.currentPath.length === 1) {
-      const conversationIndex = config.currentPath[0];
-      const conversation = conversationData[conversationIndex] || null;
-      
-      if (conversation) {
-        exportMessages(conversation, outputPath);
-      } else {
-        setStatus('Invalid conversation selected');
-      }
-    } else {
-      setStatus('Select a conversation first to export its messages');
-    }
-  } else {
-    oldHandleCommand(cmd);
+// Go to next/previous search result
+function navigateSearchResults(forward = true) {
+  if (!state.searchMode || state.searchResults.length === 0) {
+    return;
   }
-};
+  
+  if (forward) {
+    state.searchIndex = (state.searchIndex + 1) % state.searchResults.length;
+  } else {
+    state.searchIndex = (state.searchIndex - 1 + state.searchResults.length) % state.searchResults.length;
+  }
+  
+  const messageIndex = state.searchResults[state.searchIndex];
+  showMessage(messageIndex);
+  
+  ui.updateStatus(`Result ${state.searchIndex + 1} of ${state.searchResults.length} for "${state.searchTerm}"`);
+}
+
+// Show conversation switcher
+function showConversationSwitcher() {
+  updateConversationSwitcher();
+  
+  // Show the switcher
+  state.conversationSwitcherActive = true;
+  ui.conversationSwitcher.show();
+  ui.conversationSwitcher.focus();
+  ui.render();
+}
+
+// Update the conversation switcher list
+function updateConversationSwitcher() {
+  // Update conversation list
+  ui.conversationSwitcher.clearItems();
+  
+  // Add filter indicator to title if needed
+  const filterInfo = state.hideEmptyConversations ? 
+    ' (Filtered - Showing Non-Empty Only)' : '';
+  
+  ui.conversationSwitcher.setLabel(` Select Conversation${filterInfo} `);
+  
+  state.filteredConversations.forEach((conv, idx) => {
+    const title = conv.name || `Conversation ${conv.uuid.substring(0, 8)}`;
+    const date = formatDate(conv.created_at);
+    const msgCount = Array.isArray(conv.chat_messages) ? conv.chat_messages.length : 0;
+    const hasContent = hasNonEmptyMessages(conv) ? '' : ' (empty)';
+    
+    ui.conversationSwitcher.addItem(
+      `${idx + 1}. ${title} | ${date} | ${msgCount} messages${hasContent}`
+    );
+  });
+  
+  // Select current conversation
+  if (state.currentConversationIndex >= 0 && state.currentConversationIndex < state.filteredConversations.length) {
+    ui.conversationSwitcher.select(state.currentConversationIndex);
+  }
+}
+
+// Hide conversation switcher
+function hideConversationSwitcher() {
+  state.conversationSwitcherActive = false;
+  ui.conversationSwitcher.hide();
+  ui.messageContent.focus();
+  ui.render();
+}
+
+// Switch to previous/next conversation
+function switchConversation(direction) {
+  if (state.filteredConversations.length <= 1) {
+    ui.updateStatus('No other conversations available');
+    return;
+  }
+  
+  let newIndex = state.currentConversationIndex + direction;
+  
+  // Handle wrap-around
+  if (newIndex < 0) {
+    newIndex = state.filteredConversations.length - 1;
+  } else if (newIndex >= state.filteredConversations.length) {
+    newIndex = 0;
+  }
+  
+  loadConversation(newIndex);
+}
+
+// Toggle the empty conversations filter
+function toggleEmptyConversationsFilter() {
+  // Force screen reallocation to prevent UI artifacts
+  screen.realloc();
+  
+  state.hideEmptyConversations = !state.hideEmptyConversations;
+  
+  // Apply the updated filter
+  applyFilters();
+  
+  ui.updateStatus(state.hideEmptyConversations ? 
+    'Empty conversations are now hidden' : 
+    'All conversations are now shown');
+    
+  // Force a full screen redraw
+  screen.clearRegion(0, 0, screen.width, screen.height);
+  screen.render();
+}
+
+// Process command input
+function handleCommand(cmd) {
+  cmd = cmd.trim();
+  
+  if (!cmd) return;
+  
+  // Parse command and arguments
+  const parts = cmd.split(' ');
+  const command = parts[0].toLowerCase();
+  const args = parts.slice(1);
+  
+  if (command === 'load') {
+    if (args.length < 1) {
+      ui.updateStatus('Missing file path. Usage: load path/to/file.json');
+      return;
+    }
+    
+    loadConversationFile(args[0]);
+    
+  } else if (command === 'export') {
+    const outputPath = args.length >= 1 ? args[0] : null;
+    exportConversation(outputPath);
+    
+  } else if (command === 'theme') {
+    if (args.length < 1) {
+      ui.updateStatus('Missing theme name. Usage: theme light/dark');
+      return;
+    }
+    
+    const theme = args[0].toLowerCase();
+    if (theme === 'light') {
+      // Set light theme colors
+      config.theme.assistantColor = 'green';
+      config.theme.userColor = 'blue';
+      config.theme.systemColor = 'yellow';
+    } else if (theme === 'dark') {
+      // Set dark theme colors
+      config.theme.assistantColor = 'cyan';
+      config.theme.userColor = 'magenta';
+      config.theme.systemColor = 'yellow';
+    } else {
+      ui.updateStatus(`Unknown theme: ${theme}. Available themes: light, dark`);
+      return;
+    }
+    
+    // Refresh current message with new theme
+    if (state.currentMessageIndex >= 0 && state.messages.length > 0) {
+      showMessage(state.currentMessageIndex);
+    }
+    ui.updateStatus(`Theme set to ${theme}`);
+    
+  } else if (command === 'goto') {
+    // Go to conversation by index
+    if (args.length < 1) {
+      ui.updateStatus('Missing conversation index. Usage: goto [number]');
+      return;
+    }
+    
+    const index = parseInt(args[0]) - 1; // Convert from 1-based to 0-based
+    loadConversation(index);
+    
+  } else if (command === 'filter') {
+    if (args.length >= 1 && args[0].startsWith('empty=')) {
+      const value = args[0].split('=')[1].toLowerCase();
+      
+      if (value === 'true') {
+        state.hideEmptyConversations = true;
+      } else if (value === 'false') {
+        state.hideEmptyConversations = false;
+      } else {
+        ui.updateStatus('Invalid filter value. Use empty=true or empty=false');
+        return;
+      }
+      
+      applyFilters();
+    } else {
+      ui.showFilterSettings();
+    }
+    
+  } else {
+    ui.updateStatus(`Unknown command: ${command}`);
+  }
+}
+
+// Set up event listeners
+function setupEventListeners() {
+  // Quit
+  screen.key(['escape', 'q', 'C-c'], function() {
+    if (state.conversationSwitcherActive) {
+      // If conversation switcher is active, escape closes it
+      hideConversationSwitcher();
+    } else if (ui.filterSettings.visible) {
+      // If filter settings is visible, escape closes it
+      ui.filterSettings.hide();
+      ui.render();
+    } else if (state.searchMode) {
+      // If in search mode, escape clears search
+      state.searchMode = false;
+      state.searchResults = [];
+      ui.updateStatus('Search cleared');
+      ui.render();
+    } else {
+      return process.exit(0);
+    }
+  });
+  
+  // Help toggle
+  screen.key('?', function() {
+    ui.helpText.toggle();
+    ui.render();
+  });
+  
+  // Close help on key press
+  ui.helpText.key(['escape', 'q', 'enter', 'space'], function() {
+    ui.helpText.hide();
+    ui.render();
+  });
+  
+  // Message navigation
+  screen.key(['up', 'k', 'p'], function() {
+    if (state.currentMessageIndex > 0) {
+      showMessage(state.currentMessageIndex - 1);
+    }
+  });
+  
+  screen.key(['down', 'j', 'n'], function() {
+    if (state.currentMessageIndex < state.messages.length - 1) {
+      showMessage(state.currentMessageIndex + 1);
+    }
+  });
+  
+  // Jump to start/end
+  screen.key(['home', 'g'], function() {
+    if (state.messages.length > 0) {
+      showMessage(0);
+    }
+  });
+  
+  screen.key(['end', 'G'], function() {
+    if (state.messages.length > 0) {
+      showMessage(state.messages.length - 1);
+    }
+  });
+  
+  // Note: Page up/down listeners are attached when the message content is created
+  // and also when it's recreated in toggleNavPanel()
+  
+  // Toggle navigation panel
+  screen.key('t', function() {
+    ui.toggleNavPanel();
+  });
+  
+  // Toggle view mode
+  screen.key('m', function() {
+    toggleViewMode();
+  });
+  
+  // Message list selection
+  ui.messageList.on('select', function(item, index) {
+    showMessage(index);
+  });
+  
+  // Conversation switcher
+  screen.key('c', function() {
+    if (state.filteredConversations.length > 1) {
+      showConversationSwitcher();
+    } else {
+      ui.updateStatus('Only one conversation available');
+    }
+  });
+  
+  // Conversation switcher selection
+  ui.conversationSwitcher.on('select', function(item, index) {
+    hideConversationSwitcher();
+    loadConversation(index);
+  });
+  
+  // Next/previous conversation
+  screen.key(['[', 'left'], function() {
+    switchConversation(-1); // Previous
+  });
+  
+  screen.key([']', 'right'], function() {
+    switchConversation(1); // Next
+  });
+  
+  // Search mode
+  screen.key('/', function() {
+    ui.cmdInput.setValue('');
+    ui.cmdInput.show();
+    ui.cmdInput.focus();
+    ui.updateStatus('Search: Type your search term and press Enter');
+    ui.render();
+  });
+  
+  // Search navigation
+  screen.key('n', function() {
+    if (state.searchMode) {
+      navigateSearchResults(true);
+    }
+  });
+  
+  screen.key('N', function() {
+    if (state.searchMode) {
+      navigateSearchResults(false);
+    }
+  });
+  
+  // Filter settings
+  screen.key('f', function() {
+    ui.showFilterSettings();
+  });
+  
+  // Toggle hide empty conversations with shortcut
+  screen.key('h', function() {
+    toggleEmptyConversationsFilter();
+  });
+  
+  // Command mode
+  screen.key(':', function() {
+    ui.cmdInput.setValue(':');
+    ui.cmdInput.show();
+    ui.cmdInput.focus();
+    ui.updateStatus('Command mode: Enter command and press Enter');
+    ui.render();
+  });
+  
+  // Input handling
+  ui.cmdInput.key(['escape'], function() {
+    ui.cmdInput.hide();
+    ui.cmdInput.clearValue();
+    ui.updateStatus('Command canceled');
+    ui.render();
+  });
+  
+  ui.cmdInput.key(['enter'], function() {
+    const input = ui.cmdInput.getValue();
+    ui.cmdInput.hide();
+    ui.cmdInput.clearValue();
+    
+    if (input.startsWith(':')) {
+      // Command mode
+      handleCommand(input.substring(1));
+    } else {
+      // Search mode
+      searchInConversation(input);
+    }
+    
+    ui.render();
+  });
+}
+
+// Initialize the application
+function init() {
+  // Initialize UI
+  ui.init();
+  
+  // Setup event listeners
+  setupEventListeners();
+  
+  // Add welcome message
+  ui.messageContent.setContent(`
+{bold}Enhanced Conversation Viewer{/bold}
+
+This tool is designed for focused, efficient reading and 
+analysis of conversation data with improved readability.
+
+To get started, load a conversation file with the command:
+  :load path/to/conversation.json
+
+Or if provided on the command line, it will load automatically.
+
+{bold}Key Features:{/bold}
+• Efficient screen utilization for better readability
+• Multiple view modes (normal, raw, metadata)
+• Full-text search within conversations
+• Ability to hide empty conversations with 'h' key
+• Export to markdown for sharing
+
+Press {bold}?{/bold} to view all keyboard shortcuts.
+`);
+  
+  // Focus explorer by default
+  ui.messageContent.focus();
+  
+  // Handle command line arguments
+  if (process.argv.length >= 3) {
+    const filePath = process.argv[2];
+    loadConversationFile(filePath);
+  }
+  
+  ui.render();
+}
+
+// Start the application
+init();
